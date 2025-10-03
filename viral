@@ -1,0 +1,163 @@
+from flask import Flask, render_template, request, send_from_directory, redirect, url_for, flash
+import os, tempfile, uuid
+from utils import download_youtube, generate_subtitles, save_clip, apply_filter
+from moviepy.editor import VideoFileClip
+
+app = Flask(__name__)
+app.secret_key = "viral_video_processor"
+UPLOAD_FOLDER = "static/uploads"
+CLIP_FOLDER = "static/clips"
+FILTER_FOLDER = "static/filtered"
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(CLIP_FOLDER, exist_ok=True)
+os.makedirs(FILTER_FOLDER, exist_ok=True)
+
+# Available video filters
+FILTERS = ['none', 'grayscale', 'bright', 'dark', 'contrast', 'sepia', 'vignette', 'blur']
+
+@app.route("/", methods=["GET","POST"])
+def index():
+    if request.method=="POST":
+        file = request.files.get("video")
+        url = request.form.get("url")
+        top = int(request.form.get("top", 3))
+        vertical = request.form.get("vertical")=="on"
+        subs = request.form.get("subs")=="on"
+        selected_filter = request.form.get("filter", "none")
+        auto_adjust = request.form.get("auto_adjust")=="on"
+        
+        # Generate a unique ID for this processing session
+        session_id = str(uuid.uuid4())[:8]
+
+        try:
+            if url:
+                video_path = download_youtube(url, UPLOAD_FOLDER, session_id)
+            elif file:
+                filename = f"{session_id}_{file.filename}"
+                video_path = os.path.join(UPLOAD_FOLDER, filename)
+                file.save(video_path)
+            else:
+                return render_template("index.html", error="Please provide a video or URL", filters=FILTERS)
+
+            # Extract audio for subtitle generation
+            audio_path = tempfile.mktemp(suffix=".wav")
+            clip = VideoFileClip(video_path)
+            clip.audio.write_audiofile(audio_path, logger=None)
+            clip.close()
+            
+            # Generate subtitles if requested
+            subtitles = generate_subtitles(audio_path) if subs else []
+            
+            # Get video duration and calculate clip segments
+            duration = VideoFileClip(video_path).duration
+            
+            # Auto-adjust clip length for short form if requested
+            if auto_adjust:
+                # For short form, aim for clips between 15-60 seconds
+                if duration <= 60:
+                    # If video is already short, use the whole thing
+                    top = 1
+                    step = duration
+                else:
+                    # Otherwise, create optimal short-form clips
+                    ideal_length = min(60, max(15, duration / top))
+                    step = ideal_length
+            else:
+                step = max(int(duration/top), 60)
+            
+            saved_files = []
+            for i in range(top):
+                start = i * step
+                end = min(start + step, duration)
+                
+                # Skip if the remaining clip would be too short
+                if end - start < 5:  # Skip clips shorter than 5 seconds
+                    continue
+                    
+                clip_filename = f"clip_{session_id}_{i+1}.mp4"
+                output_path = os.path.join(CLIP_FOLDER, clip_filename)
+                
+                # Save the clip with all requested features
+                save_clip(
+                    video_path, 
+                    start, 
+                    end, 
+                    output_path, 
+                    subtitles, 
+                    vertical
+                )
+                
+                # Apply filter if requested (not 'none')
+                if selected_filter != "none":
+                    filtered_filename = f"filtered_{session_id}_{i+1}.mp4"
+                    filtered_path = os.path.join(FILTER_FOLDER, filtered_filename)
+                    apply_filter(output_path, filtered_path, selected_filter)
+                    saved_files.append(f"filtered/{filtered_filename}")
+                else:
+                    saved_files.append(f"clips/{clip_filename}")
+
+            flash("Videos processed successfully!", "success")
+            return render_template("clips.html", files=saved_files, filters=FILTERS)
+            
+        except Exception as e:
+            return render_template("index.html", error=f"Error processing video: {str(e)}", filters=FILTERS)
+            
+    return render_template("index.html", filters=FILTERS)
+
+@app.route("/clips/<path:filename>")
+def download_clip(filename):
+    return send_from_directory(CLIP_FOLDER, filename)
+
+@app.route("/filtered/<path:filename>")
+def download_filtered(filename):
+    return send_from_directory(FILTER_FOLDER, filename)
+
+@app.route("/export/<path:filename>")
+def export_video(filename):
+    quality = request.args.get('quality', 'high')
+    
+    # Determine source folder
+    if filename.startswith("filtered_"):
+        source_folder = FILTER_FOLDER
+    else:
+        source_folder = CLIP_FOLDER
+    
+    source_path = os.path.join(source_folder, filename)
+    
+    # If high quality is requested, just send the file directly
+    if quality == 'high':
+        return send_from_directory(source_folder, filename, as_attachment=True)
+    
+    # For other quality options, create a new version with appropriate settings
+    try:
+        # Create export folder if it doesn't exist
+        export_folder = "static/exports"
+        os.makedirs(export_folder, exist_ok=True)
+        
+        # Generate output filename with quality indicator
+        output_filename = f"{os.path.splitext(filename)[0]}_{quality}.mp4"
+        output_path = os.path.join(export_folder, output_filename)
+        
+        # Process the video with the requested quality
+        clip = VideoFileClip(source_path)
+        
+        if quality == 'medium':
+            # Medium quality: 720p resolution, moderate bitrate
+            clip = clip.resize(height=720)
+            clip.write_videofile(output_path, codec='libx264', audio_codec='aac', bitrate='2000k')
+        elif quality == 'low':
+            # Low quality: 480p resolution, lower bitrate
+            clip = clip.resize(height=480)
+            clip.write_videofile(output_path, codec='libx264', audio_codec='aac', bitrate='1000k')
+        
+        clip.close()
+        
+        # Send the processed file
+        return send_from_directory(export_folder, output_filename, as_attachment=True)
+    except Exception as e:
+        flash(f"Error exporting video: {str(e)}", "error")
+        return redirect(url_for('index'))
+
+if __name__=="__main__":
+    app.run(debug=True, host="0.0.0.0", port=5000)
+    

@@ -1,0 +1,3 @@
+# Add your API keys here
+OPENAI_API_KEY = ""
+YOUTUBE_API_KEY = ""
